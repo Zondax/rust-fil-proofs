@@ -40,7 +40,6 @@ generic-array = "0.14.4"
 groupy = "0.4.1"
 byte-slice-cast = "1.0.0"
 fr32 = { path = "../fr32", version = "^1.0.0", default-features = false }
-scheduler_client = {package = "client", git = "https://github.com/Zondax/filecoin-scheduling.git", branch = "review"}
 
 [dev-dependencies]
 criterion = "0.3"

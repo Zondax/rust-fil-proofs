@@ -16,7 +16,7 @@ use merkletree::{
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
 };
-use rust_gpu_tools::opencl::GPUSelector;
+#[cfg(any(feature = "gpu"))]
 use scheduler_client::{ResourceAlloc, TaskResult};
 use storage_proofs_core::{
     cache_key::CacheKey,
@@ -46,7 +46,7 @@ use crate::{
             ReplicaColumnProof, Tau, TemporaryAux, TemporaryAuxCache, TransformedLayers,
             BINARY_ARITY,
         },
-        proof_ext, EncodingProof, LabelingProof,
+        EncodingProof, LabelingProof,
     },
     PoRep,
 };
@@ -473,6 +473,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         use std::cmp::min;
         use std::sync::{mpsc::sync_channel, Arc, RwLock};
 
+        use crate::stacked::vanilla::proof_ext::Builder;
         use bellperson::bls::Fr;
         use fr32::fr_into_bytes;
         use generic_array::GenericArray;
@@ -591,10 +592,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                             let alloc = alloc.ok_or(Error::Unclassified(
                                 "No resource allocation for TreeBuilder".to_string(),
                             ))?;
-                            let selector = GPUSelector::Uuid(alloc.devices[0]);
                             column_tree_builder =
                                 Some(ColumnTreeBuilder::<ColumnArity, TreeArity>::new(
-                                    Some(BatcherType::CustomGPU(selector)),
+                                    Some(BatcherType::CustomGPU(alloc.devices[0])),
                                     nodes_count,
                                     max_gpu_column_batch_size,
                                     max_gpu_tree_batch_size,
@@ -648,8 +648,8 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                     };
                     // use a builder that pass this call function to the scheduler-client
                     // so it handles preemption and accesses to the resources.
-                    let mut builder = proof_ext::Builder::new(call, config_count);
-                    builder.build().expect("failed building tree");
+                    let mut cbuilder = Builder::new(call, config_count);
+                    cbuilder.build().expect("failed building tree");
                 });
 
                 for config in &configs {
@@ -872,6 +872,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         use std::io::Write;
         use std::sync::mpsc::sync_channel;
 
+        use crate::stacked::vanilla::proof_ext::Builder;
         use bellperson::bls::Fr;
         use fr32::fr_into_bytes;
         use merkletree::merkle::{get_merkle_tree_cache_size, get_merkle_tree_leafs};
@@ -987,11 +988,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                             "No resource allocation for TreeBuilder".to_string(),
                         ))?;
 
-                        let selector = GPUSelector::Uuid(alloc.devices[0]);
-
                         tree_builder = Some(
                             TreeBuilder::<Tree::Arity>::new(
-                                Some(BatcherType::CustomGPU(selector)),
+                                Some(BatcherType::CustomGPU(alloc.devices[0])),
                                 nodes_count,
                                 max_gpu_tree_batch_size,
                                 tree_r_last_config.rows_to_discard,
@@ -1034,7 +1033,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                         Ok(TaskResult::Done)
                     }
                 };
-                let mut builder = proof_ext::Builder::new(call, config_count);
+                let mut builder = Builder::new(call, config_count);
                 builder.build().expect("failed building tree");
             });
 
@@ -1440,6 +1439,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         use std::fs::OpenOptions;
         use std::io::Write;
 
+        use crate::stacked::vanilla::proof_ext::Builder;
         use bellperson::bls::Fr;
         use ff::Field;
         use fr32::fr_into_bytes;
@@ -1466,10 +1466,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                     let alloc = alloc.ok_or(Error::Unclassified(
                         "No resource allocation for TreeBuilder".to_string(),
                     ))?;
-                    let selector = GPUSelector::Uuid(alloc.devices[0]);
                     tree_builder = Some(
                         TreeBuilder::<Tree::Arity>::new(
-                            Some(BatcherType::CustomGPU(selector)),
+                            Some(BatcherType::CustomGPU(alloc.devices[0])),
                             nodes_count,
                             max_gpu_tree_batch_size,
                             tree_r_last_config.rows_to_discard,
@@ -1544,7 +1543,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 }
                 Ok(TaskResult::Done)
             };
-            let mut builder = proof_ext::Builder::new(call, configs.len());
+            let mut builder = Builder::new(call, configs.len());
             builder.build().expect("failed building fake tree_r_last");
         } else {
             info!("generating tree r last using the CPU");
