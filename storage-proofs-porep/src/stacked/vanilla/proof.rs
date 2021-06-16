@@ -589,9 +589,11 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                     let call = |alloc: Option<&ResourceAlloc>| -> Result<TaskResult, Error> {
                         // check to initialize the builder
                         if column_tree_builder.is_none() {
-                            let alloc = alloc.ok_or(Error::Unclassified(
-                                "No resource allocation for TreeBuilder".to_string(),
-                            ))?;
+                            let alloc = alloc.ok_or_else(|| {
+                                Error::Unclassified(
+                                    "No resource allocation for TreeBuilder".to_string(),
+                                )
+                            })?;
                             column_tree_builder =
                                 Some(ColumnTreeBuilder::<ColumnArity, TreeArity>::new(
                                     Some(BatcherType::CustomGPU(alloc.devices[0])),
@@ -601,9 +603,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                                 )?);
                         }
 
-                        let builder = column_tree_builder.as_mut().ok_or(Error::Unclassified(
-                            "failed creating tree builder".to_string(),
-                        ))?;
+                        let builder = column_tree_builder.as_mut().ok_or_else(|| {
+                            Error::Unclassified("failed creating tree builder".to_string())
+                        })?;
 
                         // build all trees for each config
                         if i < config_count {
@@ -984,9 +986,11 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 let call = |alloc: Option<&ResourceAlloc>| -> Result<TaskResult, Error> {
                     // initialize the tree builder using the resource that the scheduler assigned
                     if tree_builder.is_none() {
-                        let alloc = alloc.ok_or(Error::Unclassified(
-                            "No resource allocation for TreeBuilder".to_string(),
-                        ))?;
+                        let alloc = alloc.ok_or_else(|| {
+                            Error::Unclassified(
+                                "No resource allocation for TreeBuilder".to_string(),
+                            )
+                        })?;
 
                         tree_builder = Some(
                             TreeBuilder::<Tree::Arity>::new(
@@ -998,9 +1002,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                             .map_err(|e| Error::Unclassified(e.to_string()))?,
                         );
                     }
-                    let builder = tree_builder.as_mut().ok_or(Error::Unclassified(
-                        "No resource allocation for tree builder".to_string(),
-                    ))?;
+                    let builder = tree_builder.as_mut().ok_or_else(|| {
+                        Error::Unclassified("No resource allocation for tree builder".to_string())
+                    })?;
 
                     // Loop until all trees for all configs have been built.
                     if i < config_count {
@@ -1463,9 +1467,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             // this call-closure would block until it is done building the trees
             let call = |alloc: Option<&ResourceAlloc>| -> Result<TaskResult, Error> {
                 if tree_builder.is_none() {
-                    let alloc = alloc.ok_or(Error::Unclassified(
-                        "No resource allocation for TreeBuilder".to_string(),
-                    ))?;
+                    let alloc = alloc.ok_or_else(|| {
+                        Error::Unclassified("No resource allocation for TreeBuilder".to_string())
+                    })?;
                     tree_builder = Some(
                         TreeBuilder::<Tree::Arity>::new(
                             Some(BatcherType::CustomGPU(alloc.devices[0])),
@@ -1476,9 +1480,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                         .map_err(|e| Error::Unclassified(e.to_string()))?,
                     );
                 }
-                let builder = tree_builder.as_mut().ok_or(Error::Unclassified(
-                    "No resource allocation for tree builder".to_string(),
-                ))?;
+                let builder = tree_builder.as_mut().ok_or_else(|| {
+                    Error::Unclassified("No resource allocation for tree builder".to_string())
+                })?;
 
                 // Allocate zeros once and reuse.
                 let zero_leaves: Vec<Fr> = vec![Fr::zero(); max_gpu_tree_batch_size];
@@ -1508,9 +1512,9 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                         let tree_data_len = tree_data.len();
                         let cache_size = get_merkle_tree_cache_size(
                             get_merkle_tree_leafs(
-                                config.size.ok_or(Error::Unclassified(
-                                    "config size failure".to_string(),
-                                ))?,
+                                config.size.ok_or_else(|| {
+                                    Error::Unclassified("config size failure".to_string())
+                                })?,
                                 Tree::Arity::to_usize(),
                             )
                             .map_err(|e| Error::Unclassified(e.to_string()))?,
