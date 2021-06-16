@@ -6,9 +6,8 @@ use bellperson::{
         aggregate::{
             aggregate_proofs, verify_aggregate_proof, AggregateProof, ProverSRS, VerifierSRS,
         },
-        create_random_proof_batch, create_random_proof_batch_in_priority,
-        create_random_proof_batch_with_type, verify_proofs_batch, PreparedVerifyingKey,
-        , create_random_proof_batch_with_type, verify_proofs_batch, BellTaskType
+        create_random_proof_batch_with_type, verify_proofs_batch, BellTaskType,
+        PreparedVerifyingKey,
     },
     Circuit,
 };
