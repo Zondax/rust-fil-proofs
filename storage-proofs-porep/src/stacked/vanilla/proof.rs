@@ -51,6 +51,15 @@ use crate::{
     PoRep,
 };
 
+use lazy_static::lazy_static;
+lazy_static! {
+    // This ThreadPool is used for running the part of the tree-builder that uses the
+    // scheduler-client. this allow to separate tasks that that depend on each other through channels
+    // which can provoke deadlocks.
+    pub static ref SCHEDULER_POOL: rayon::ThreadPool =
+        rayon::ThreadPoolBuilder::new().build().unwrap();
+}
+
 pub const TOTAL_PARENTS: usize = 37;
 
 #[derive(Debug)]
@@ -471,7 +480,10 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         TreeArity: PoseidonArity,
     {
         use std::cmp::min;
-        use std::sync::{mpsc::sync_channel, Arc, RwLock};
+        use std::sync::{
+            mpsc::{channel, sync_channel},
+            Arc, RwLock,
+        };
 
         use crate::stacked::vanilla::proof_ext::Builder;
         use bellperson::bls::Fr;
@@ -502,93 +514,22 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
             let column_write_batch_size = SETTINGS.column_write_batch_size as usize;
 
             // This channel will receive batches of columns and add them to the ColumnTreeBuilder.
-            let (builder_tx, builder_rx) = sync_channel(0);
+            let (builder_tx, builder_rx) = channel();
+            let (writer_tx, writer_rx) = channel::<(Vec<Fr>, Vec<Fr>)>();
 
             let config_count = configs.len(); // Don't move config into closure below.
-            rayon::scope(|s| {
-                // This channel will receive the finished tree data to be written to disk.
-                let (writer_tx, writer_rx) = sync_channel::<(Vec<Fr>, Vec<Fr>)>(0);
+            let conf = configs.clone();
+            SCHEDULER_POOL.spawn(move || {
+                let mut column_tree_builder = None;
+                let mut done_adding_columns = false;
+                let mut i = 0;
+                let context = Some(format!("{}:{}", file!(), line!()));
 
-                s.spawn(move |_| {
-                    for i in 0..config_count {
-                        let mut node_index = 0;
-                        let builder_tx = builder_tx.clone();
-                        while node_index != nodes_count {
-                            let chunked_nodes_count =
-                                min(nodes_count - node_index, max_gpu_column_batch_size);
-                            trace!(
-                                "processing config {}/{} with column nodes {}",
-                                i + 1,
-                                tree_count,
-                                chunked_nodes_count,
-                            );
-
-                            let columns: Vec<GenericArray<Fr, ColumnArity>> = {
-                                use fr32::bytes_into_fr;
-
-                                // Allocate layer data array and insert a placeholder for each layer.
-                                let mut layer_data: Vec<Vec<u8>> =
-                                    vec![
-                                        vec![0u8; chunked_nodes_count * std::mem::size_of::<Fr>()];
-                                        layers
-                                    ];
-
-                                // gather all layer data.
-                                for (layer_index, mut layer_bytes) in
-                                    layer_data.iter_mut().enumerate()
-                                {
-                                    let store = labels.labels_for_layer(layer_index + 1);
-                                    let start = (i * nodes_count) + node_index;
-                                    let end = start + chunked_nodes_count;
-
-                                    store
-                                        .read_range_into(start, end, &mut layer_bytes)
-                                        .expect("failed to read store range");
-                                }
-
-                                (0..chunked_nodes_count)
-                                    //.into_par_iter()
-                                    .into_iter()
-                                    .map(|index| {
-                                        (0..layers)
-                                            .map(|layer_index| {
-                                                bytes_into_fr(
-                                                &layer_data[layer_index][std::mem::size_of::<Fr>()
-                                                    * index
-                                                    ..std::mem::size_of::<Fr>() * (index + 1)],
-                                            )
-                                            .expect("Could not create Fr from bytes.")
-                                            })
-                                            .collect::<GenericArray<Fr, ColumnArity>>()
-                                    })
-                                    .collect()
-                            };
-
-                            node_index += chunked_nodes_count;
-                            trace!(
-                                "node index {}/{}/{}",
-                                node_index,
-                                chunked_nodes_count,
-                                nodes_count,
-                            );
-
-                            let is_final = node_index == nodes_count;
-                            builder_tx
-                                .send((columns, is_final))
-                                .expect("failed to send columns");
-                        }
-                    }
-                });
-                s.spawn(move |_| {
-                    let mut column_tree_builder = None;
-                    let mut done_adding_columns = false;
-                    let mut i = 0;
-                    let context = Some(format!("{}:{}", file!(), line!()));
-
-                    // funcion that is called by the scheduler
-                    // multiple times until TaskResult::Done is returned
-                    // this allows preemption between calls to this function
-                    let call = |alloc: Option<&ResourceAlloc>| -> Result<TaskResult, Error> {
+                // funcion that is called by the scheduler
+                // multiple times until TaskResult::Done is returned
+                // this allows preemption between calls to this function
+                let call =
+                    |alloc: Option<&ResourceAlloc>| -> Result<TaskResult, Error> {
                         // check to initialize the builder
                         if column_tree_builder.is_none() {
                             let alloc = alloc.ok_or_else(|| {
@@ -660,11 +601,84 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                             Ok(TaskResult::Done)
                         }
                     };
-                    // use a builder that pass this call function to the scheduler-client
-                    // so it handles preemption and accesses to the resources.
-                    let mut cbuilder =
-                        Builder::new(call, config_count, Some("tree-c-gpu".to_string()), context);
-                    cbuilder.build().expect("failed building tree");
+                // use a builder that pass this call function to the scheduler-client
+                // so it handles preemption and accesses to the resources.
+                let mut cbuilder =
+                    Builder::new(call, config_count, Some("tree-c-gpu".to_string()), context);
+                cbuilder.build().expect("failed building tree");
+            });
+            rayon::scope(move |s| {
+                // This channel will receive the finished tree data to be written to disk.
+                //let (writer_tx, writer_rx) = sync_channel::<(Vec<Fr>, Vec<Fr>)>(0);
+                let configs = conf;
+                s.spawn(move |_| {
+                    for i in 0..config_count {
+                        let mut node_index = 0;
+                        let builder_tx = builder_tx.clone();
+                        while node_index != nodes_count {
+                            let chunked_nodes_count =
+                                min(nodes_count - node_index, max_gpu_column_batch_size);
+                            trace!(
+                                "processing config {}/{} with column nodes {}",
+                                i + 1,
+                                tree_count,
+                                chunked_nodes_count,
+                            );
+
+                            let columns: Vec<GenericArray<Fr, ColumnArity>> = {
+                                use fr32::bytes_into_fr;
+
+                                // Allocate layer data array and insert a placeholder for each layer.
+                                let mut layer_data: Vec<Vec<u8>> =
+                                    vec![
+                                        vec![0u8; chunked_nodes_count * std::mem::size_of::<Fr>()];
+                                        layers
+                                    ];
+
+                                // gather all layer data.
+                                for (layer_index, mut layer_bytes) in
+                                    layer_data.iter_mut().enumerate()
+                                {
+                                    let store = labels.labels_for_layer(layer_index + 1);
+                                    let start = (i * nodes_count) + node_index;
+                                    let end = start + chunked_nodes_count;
+
+                                    store
+                                        .read_range_into(start, end, &mut layer_bytes)
+                                        .expect("failed to read store range");
+                                }
+
+                                (0..chunked_nodes_count)
+                                    .into_par_iter()
+                                    .map(|index| {
+                                        (0..layers)
+                                            .map(|layer_index| {
+                                                bytes_into_fr(
+                                                &layer_data[layer_index][std::mem::size_of::<Fr>()
+                                                    * index
+                                                    ..std::mem::size_of::<Fr>() * (index + 1)],
+                                            )
+                                            .expect("Could not create Fr from bytes.")
+                                            })
+                                            .collect::<GenericArray<Fr, ColumnArity>>()
+                                    })
+                                    .collect()
+                            };
+
+                            node_index += chunked_nodes_count;
+                            trace!(
+                                "node index {}/{}/{}",
+                                node_index,
+                                chunked_nodes_count,
+                                nodes_count,
+                            );
+
+                            let is_final = node_index == nodes_count;
+                            builder_tx
+                                .send((columns, is_final))
+                                .expect("failed to send columns");
+                        }
+                    }
                 });
 
                 for config in &configs {
@@ -885,7 +899,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         use std::cmp::min;
         use std::fs::OpenOptions;
         use std::io::Write;
-        use std::sync::mpsc::sync_channel;
+        use std::sync::mpsc::{channel, sync_channel};
 
         use crate::stacked::vanilla::proof_ext::Builder;
         use bellperson::bls::Fr;
@@ -910,13 +924,85 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         let max_gpu_tree_batch_size = SETTINGS.max_gpu_tree_batch_size as usize;
 
         // This channel will receive batches of leaf nodes and add them to the TreeBuilder.
-        let (builder_tx, builder_rx) = sync_channel::<(Vec<Fr>, bool)>(0);
+        let (builder_tx, builder_rx) = channel::<(Vec<Fr>, bool)>();
         let config_count = configs.len(); // Don't move config into closure below.
         let configs = &configs;
+        //let tree_r_last_config = &tree_r_last_config;
         let tree_r_last_config = &tree_r_last_config;
-        rayon::scope(|s| {
+        let rows_to_discard = tree_r_last_config.rows_to_discard;
+        let (writer_tx, writer_rx) = channel::<Vec<Fr>>();
+        SCHEDULER_POOL.spawn(move || {
+            let mut tree_builder = None;
+            let mut done_adding_columns = false;
+            let mut i = 0;
+            let context = Some(format!("{}:{}", file!(), line!()));
+            let call = |alloc: Option<&ResourceAlloc>| -> Result<TaskResult, Error> {
+                // initialize the tree builder using the resource that the scheduler assigned
+                if tree_builder.is_none() {
+                    let alloc = alloc.ok_or_else(|| {
+                        Error::Unclassified("No resource allocation for TreeBuilder".to_string())
+                    })?;
+
+                    let device =
+                        alloc.devices[0]
+                            .get_device()
+                            .ok_or(Error::Unclassified(format!(
+                                "Device with id: {:?} not found",
+                                alloc.devices[0]
+                            )))?;
+
+                    let tree_batcher = Batcher::new(device, max_gpu_tree_batch_size)
+                        .expect("failed to create tree batcher");
+
+                    tree_builder = Some(TreeBuilder::<TreeArity>::new(
+                        Some(tree_batcher),
+                        nodes_count,
+                        rows_to_discard,
+                    )?);
+                }
+                let builder = tree_builder.as_mut().ok_or_else(|| {
+                    Error::Unclassified("No resource allocation for tree builder".to_string())
+                })?;
+
+                // Loop until all trees for all configs have been built.
+                if i < config_count {
+                    // still missing columns that have to be pushed into the builder
+                    if !done_adding_columns {
+                        let (encoded, last) = builder_rx
+                            .recv()
+                            .map_err(|e| Error::Unclassified(e.to_string()))?;
+
+                        // Just add non-final leaf batches.
+                        builder.add_leaves(&encoded)?;
+                        done_adding_columns = last;
+                    } else {
+                        // If we get here, we are done adding columns/leaves: build a sub-tree.
+                        info!(
+                            "building base tree_r_last with GPU {}/{}",
+                            i + 1,
+                            tree_count
+                        );
+                        if let Some((_, tree_data)) = builder.build_next()? {
+                            writer_tx
+                                .send(tree_data)
+                                .map_err(|e| Error::Unclassified(e.to_string()))?;
+                            done_adding_columns = false;
+                            i += 1;
+                        }
+                    }
+                    Ok(TaskResult::Continue)
+                } else {
+                    Ok(TaskResult::Done)
+                }
+            };
+
+            let mut builder =
+                Builder::new(call, config_count, Some("tree-r-gpu".to_string()), context);
+            builder.build().expect("failed building tree");
+        });
+        rayon::scope(move |s| {
             // This channel will receive the finished tree data to be written to disk.
-            let (writer_tx, writer_rx) = sync_channel::<Vec<Fr>>(0);
+            //let (writer_tx, writer_rx) = sync_channel::<Vec<Fr>>(0);
 
             s.spawn(move |_| {
                 for i in 0..config_count {
@@ -992,77 +1078,6 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                     }
                 }
             });
-            s.spawn(move |_| {
-                let mut tree_builder = None;
-                let mut done_adding_columns = false;
-                let mut i = 0;
-                let context = Some(format!("{}:{}", file!(), line!()));
-                let call = |alloc: Option<&ResourceAlloc>| -> Result<TaskResult, Error> {
-                    // initialize the tree builder using the resource that the scheduler assigned
-                    if tree_builder.is_none() {
-                        let alloc = alloc.ok_or_else(|| {
-                            Error::Unclassified(
-                                "No resource allocation for TreeBuilder".to_string(),
-                            )
-                        })?;
-
-                        let device =
-                            alloc.devices[0]
-                                .get_device()
-                                .ok_or(Error::Unclassified(format!(
-                                    "Device with id: {:?} not found",
-                                    alloc.devices[0]
-                                )))?;
-
-                        let tree_batcher = Batcher::new(device, max_gpu_tree_batch_size)
-                            .expect("failed to create tree batcher");
-
-                        tree_builder = Some(TreeBuilder::<TreeArity>::new(
-                            Some(tree_batcher),
-                            nodes_count,
-                            tree_r_last_config.rows_to_discard,
-                        )?);
-                    }
-                    let builder = tree_builder.as_mut().ok_or_else(|| {
-                        Error::Unclassified("No resource allocation for tree builder".to_string())
-                    })?;
-
-                    // Loop until all trees for all configs have been built.
-                    if i < config_count {
-                        // still missing columns that have to be pushed into the builder
-                        if !done_adding_columns {
-                            let (encoded, last) = builder_rx
-                                .recv()
-                                .map_err(|e| Error::Unclassified(e.to_string()))?;
-
-                            // Just add non-final leaf batches.
-                            builder.add_leaves(&encoded)?;
-                            done_adding_columns = last;
-                        } else {
-                            // If we get here, we are done adding columns/leaves: build a sub-tree.
-                            info!(
-                                "building base tree_r_last with GPU {}/{}",
-                                i + 1,
-                                tree_count
-                            );
-                            if let Some((_, tree_data)) = builder.build_next()? {
-                                writer_tx
-                                    .send(tree_data)
-                                    .map_err(|e| Error::Unclassified(e.to_string()))?;
-                                done_adding_columns = false;
-                                i += 1;
-                            }
-                        }
-                        Ok(TaskResult::Continue)
-                    } else {
-                        Ok(TaskResult::Done)
-                    }
-                };
-                let mut builder =
-                    Builder::new(call, config_count, Some("tree-r-gpu".to_string()), context);
-                builder.build().expect("failed building tree");
-            });
-
             for config in configs.iter() {
                 let tree_data = writer_rx
                     .recv()
@@ -1105,7 +1120,10 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         });
 
         create_lc_tree::<LCTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>(
-            tree_r_last_config.size.expect("config size failure"),
+            tree_r_last_config
+                .clone()
+                .size
+                .expect("config size failure"),
             &configs,
             &replica_config,
         )
